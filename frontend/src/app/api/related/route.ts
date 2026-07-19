@@ -1,31 +1,27 @@
 import { NextResponse } from "next/server";
-import { requireUser } from "@/lib/firebase/admin";
-import { loadProject } from "@/lib/ai/server";
-import { retrieveAndRerank } from "@/lib/ai/retrieval";
 
+/** Proxy to the FastAPI RAG backend (smart linking). See api/chat/route.ts. */
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Smart linking: given a task's project + a query, return related knowledge chunks. */
-export async function POST(req: Request) {
-  let user;
-  try {
-    user = await requireUser(req);
-  } catch (r) {
-    return r instanceof Response ? r : NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+const API = process.env.RAG_API_URL || "http://localhost:8000";
 
+export async function POST(req: Request) {
+  const auth = req.headers.get("authorization") || "";
+  const body = await req.text();
   try {
-    const { projectId, query } = (await req.json()) as { projectId?: string; query?: string };
-    if (!projectId || !query) {
-      return NextResponse.json({ error: "projectId and query are required" }, { status: 400 });
-    }
-    const project = await loadProject(user.uid, projectId);
-    const chunks = await retrieveAndRerank([project.ragNamespace], query, 3);
-    return NextResponse.json({ chunks });
-  } catch (err) {
-    if (err instanceof Response) return err;
-    console.error("related error", err);
+    const res = await fetch(`${API}/api/related`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: auth },
+      body,
+    });
+    const text = await res.text();
+    return new NextResponse(text, {
+      status: res.status,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    // Smart-linking is best-effort; never surface a hard error to the UI.
     return NextResponse.json({ chunks: [] });
   }
 }
