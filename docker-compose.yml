@@ -1,0 +1,29 @@
+# Run the backend (and optionally the frontend) together for local development.
+# The backend is the deployment target for AWS ECS; compose just mirrors it locally.
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    restart: unless-stopped
+
+  # The frontend runs on Node; kept as an optional local convenience. In
+  # production the frontend deploys separately (Netlify) and calls the backend.
+  frontend:
+    image: node:24-slim
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- -p 3000 -H 0.0.0.0"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    env_file:
+      - ./frontend/.env.local
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+    depends_on:
+      - backend
+    profiles:
+      - fullstack        # `docker compose --profile fullstack up` to include it

@@ -1,0 +1,38 @@
+# --- Secrets / env (never commit) ---
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.local
+**/.env.*.local
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node / Next.js (frontend) ---
+node_modules/
+.next/
+out/
+.netlify/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- Docker ---
+# (compose overrides, if any)
+docker-compose.override.yml
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,5 @@
+{
+  "comment": "All app queries are single-field equality / array-contains and sort client-side, so no composite indexes are required. Deploy with: firebase deploy --only firestore",
+  "indexes": [],
+  "fieldOverrides": []
+}

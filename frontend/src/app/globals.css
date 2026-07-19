@@ -1,0 +1,255 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   Design tokens. Dark is the default (this audience lives in dark mode).
+   Light mode is a first-class fallback, toggled by `.light` on <html>.
+   Every colour is `R G B` (space separated) so Tailwind can apply <alpha-value>.
+   ========================================================================== */
+:root,
+.dark {
+  --bg: 7 8 11; /* #07080b — the near-black base from the mock */
+  --surface: 15 17 22;
+  --surface-2: 21 24 31;
+  --surface-3: 28 32 41;
+  --border: 33 38 48;
+  --border-strong: 50 57 71;
+
+  --text: 231 233 238; /* #e7e9ee */
+  --text-muted: 150 158 173;
+  --text-faint: 99 107 122;
+
+  --accent: 245 197 24; /* #f5c518 — the one confident accent */
+  --accent-hover: 250 212 66;
+  --accent-fg: 12 13 17; /* near-black text sits on the gold */
+  --accent-soft: 245 197 24;
+
+  --todo: 150 158 173;
+  --progress: 96 165 250;
+  --blocked: 248 113 113;
+  --done: 74 222 128;
+
+  --danger: 248 113 113;
+  --warn: 251 191 36;
+  --ok: 74 222 128;
+  --info: 96 165 250;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+
+  color-scheme: dark;
+}
+
+.light {
+  --bg: 249 249 247;
+  --surface: 255 255 255;
+  --surface-2: 245 245 243;
+  --surface-3: 238 238 235;
+  --border: 228 228 224;
+  --border-strong: 208 208 202;
+
+  --text: 23 25 31;
+  --text-muted: 88 94 106;
+  --text-faint: 140 146 158;
+
+  --accent: 181 132 8; /* darkened gold keeps AA contrast on light surfaces */
+  --accent-hover: 156 113 6;
+  --accent-fg: 255 255 255;
+  --accent-soft: 245 197 24;
+
+  --todo: 120 126 138;
+  --progress: 37 99 235;
+  --blocked: 220 38 38;
+  --done: 22 163 74;
+
+  --danger: 220 38 38;
+  --warn: 202 138 4;
+  --ok: 22 163 74;
+  --info: 37 99 235;
+
+  color-scheme: light;
+}
+
+* {
+  border-color: rgb(var(--border));
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: rgb(var(--bg));
+  color: rgb(var(--text));
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+::selection {
+  background: rgb(var(--accent) / 0.28);
+  color: rgb(var(--text));
+}
+
+/* Focus ring — visible but tasteful, gold-tinted */
+:focus-visible {
+  outline: 2px solid rgb(var(--accent) / 0.55);
+  outline-offset: 1px;
+}
+
+/* Thin, self-effacing scrollbars — the Linear/Notion feel */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--border-strong)) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgb(var(--border-strong));
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--text-faint));
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@layer components {
+  /* Frosted panel used for popovers, the standup card, command menus */
+  .glass {
+    background: rgb(var(--surface) / 0.85);
+    backdrop-filter: blur(14px) saturate(1.2);
+    border: 1px solid rgb(var(--border));
+  }
+
+  /* Standard raised card */
+  .card {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--border));
+    border-radius: 11px;
+    transition:
+      border-color 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+      box-shadow 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  /* Subtle top-lit gradient on hero surfaces */
+  .lit {
+    background-image: linear-gradient(
+      180deg,
+      rgb(var(--surface-2)) 0%,
+      rgb(var(--surface)) 42%
+    );
+  }
+
+  /* Monospace metadata (IDs, timestamps) */
+  .mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+}
+
+/* Print: show only the export sheet, hide all app chrome. */
+@media print {
+  body > *:not(.print-root) {
+    display: none !important;
+  }
+  .print-root {
+    position: static !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+  @page {
+    margin: 14mm;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  /* Hover lift for interactive cards/buttons. */
+  .lift {
+    transition:
+      transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+      box-shadow 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .lift:hover {
+    transform: translateY(-2px);
+  }
+  .lift:active {
+    transform: translateY(0);
+  }
+
+  /* Loading shimmer for skeleton states */
+  .shimmer {
+    position: relative;
+    overflow: hidden;
+  }
+  .shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgb(var(--text) / 0.06),
+      transparent
+    );
+    animation: shimmer 1.5s infinite;
+  }
+}
+
+/* React Flow (mind map) — themed to match the dark/light tokens. */
+.mindmap .react-flow__controls-button {
+  background: rgb(var(--surface));
+  border-bottom: 1px solid rgb(var(--border));
+  color: rgb(var(--text-muted));
+}
+.mindmap .react-flow__controls-button:hover {
+  background: rgb(var(--surface-2));
+}
+.mindmap .react-flow__controls-button svg {
+  fill: currentColor;
+}
+.mindmap .react-flow__attribution {
+  display: none;
+}
+
+/* Respect users who prefer less motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* BlockNote (Pages editor): blend into the app surface instead of Mantine's
+   default panel look. Menus/toolbars keep their own styling. */
+.sb-blocknote,
+.sb-blocknote .bn-editor {
+  background: transparent !important;
+}
+.sb-blocknote .bn-editor {
+  padding-inline: 0;
+}

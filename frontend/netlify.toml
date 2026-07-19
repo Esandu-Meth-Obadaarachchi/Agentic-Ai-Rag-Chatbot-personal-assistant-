@@ -1,0 +1,11 @@
+# Netlify build config. Manual deploys for now (no CI/CD) — the Next.js runtime
+# plugin turns the App Router API routes into serverless functions and handles
+# SSR. Env vars live on the Netlify site, not in this file.
+[build]
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"

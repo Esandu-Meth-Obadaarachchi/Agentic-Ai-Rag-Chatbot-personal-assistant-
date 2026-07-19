@@ -1,0 +1,91 @@
+rules_version = '2';
+
+// Second Brain — per-workspace isolation. Every doc carries `memberIds`; a user
+// can only touch a document if their uid is in that list. This keeps businesses
+// (Office / Freelance / LeadX) fully separated with no cross-workspace bleed.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isMember(data) {
+      return signedIn() && request.auth.uid in data.memberIds;
+    }
+
+    match /workspaces/{id} {
+      allow read: if isMember(resource.data);
+      allow create: if isMember(request.resource.data)
+        && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isMember(resource.data) && isMember(request.resource.data);
+      allow delete: if signedIn() && resource.data.ownerId == request.auth.uid;
+    }
+
+    match /projects/{id} {
+      allow read: if isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    match /tasks/{id} {
+      allow read: if isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    // Live presence on a task. A user may only write their own presence doc
+    // (doc id is `${taskId}_${uid}`), and only within a workspace they belong to.
+    match /presence/{id} {
+      allow read: if isMember(resource.data);
+      allow create, update: if isMember(request.resource.data)
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // Per-user daily planner notes. memberIds is always the single owner uid.
+    // A not-yet-created doc has a null `resource`, so allow signed-in reads of
+    // the empty state (there is nothing to leak) and gate everything else on
+    // membership. Ordering matters: the null check short-circuits before
+    // isMember touches resource.data.
+    match /dayPlans/{id} {
+      allow read: if (resource == null && signedIn()) || isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    // Per-project whiteboard scenes. memberIds mirrors the project's members.
+    // Same null-resource handling so a project with no saved scene can load an
+    // empty canvas instead of hanging on a permission error.
+    match /whiteboards/{id} {
+      allow read: if (resource == null && signedIn()) || isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    // Notion-style pages. memberIds mirrors the workspace or the page's project.
+    match /pages/{id} {
+      allow read: if (resource == null && signedIn()) || isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    // Saved agent conversations, personal to one user (memberIds = [uid]).
+    match /chats/{id} {
+      allow read: if isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    // Individual turns within a chat. Same per-user isolation as the chat.
+    match /chatMessages/{id} {
+      allow read: if isMember(resource.data);
+      allow create: if isMember(request.resource.data);
+      allow update, delete: if isMember(resource.data);
+    }
+
+    // Share invitations are managed entirely server-side by the Admin SDK
+    // (which bypasses rules), so clients get no direct access.
+    match /invites/{id} {
+      allow read, write: if false;
+    }
+  }
+}
