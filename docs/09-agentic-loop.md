@@ -1,209 +1,106 @@
 # 09 — The agentic loop
 
-This is the brain. It is a state machine built with LangGraph. Each node is one step. Edges decide what happens next based on the state. Read this file slowly, because every node earns its place.
+This build has two loops, not one, and they nest. Understand the shape before the code: an outer tool-calling agent (the ReAct loop), and an inner retrieval loop (a LangGraph state machine) that the agent reaches for only when it decides to search knowledge.
 
-## Why LangGraph and not a plain chain
+## Why two loops, not one big graph
 
-A plain LangChain chain is a straight pipe: A then B then C, once, no going back. Our loop needs to branch (small talk skips retrieval) and repeat (weak retrieval triggers a retry). LangGraph models exactly this. It holds a shared state object, runs nodes that read and update it, and follows conditional edges. You get loops, retries, and branches with a limit, and every transition shows up in LangSmith.
+An earlier design for this project (see the git history) planned one top-level graph: route -> rewrite -> retrieve -> rerank -> grade -> generate -> self-check, every question passing through every node. This build took a different, and arguably more faithful, shape: it ports the original TypeScript app's design, which is a Claude tool-calling agent that decides for itself, per turn, whether a question needs a knowledge search, a task lookup, a task write, or just an answer from the conversation. That decision is not a separate "router" node — it is the normal behaviour of a tool-calling model: it only calls a tool when the tool is useful.
 
-## The shared state
+The result: small talk costs one model call and no tool calls, exactly as the routed design intended, but without hand-writing a classifier prompt. The trade is that this loop is a LangGraph *prebuilt* (`create_react_agent`), not a graph you author node by node — you get less visible control over the top-level shape, in exchange for a battle-tested tool loop.
 
-Every node reads and writes one state dict. Define it up front.
+## Outer loop: the ReAct agent
+
+`backend/app/rag/agent.py` builds the agent per request:
 
 ```python
-from typing import TypedDict, Literal
+from langgraph.prebuilt import create_react_agent
 
-class RagState(TypedDict):
-    # set before the loop (from FastAPI, trusted)
-    workspace_id: str
-    allowed_project_ids: list[str]
-    search_project_ids: list[str]
-    namespace: str
-    chat_history: list[dict]
+agent = create_react_agent(get_llm(), build_tools(ctx), prompt=system)
+result = agent.invoke({"messages": messages}, config={"recursion_limit": MAX_RECURSION})
+```
 
-    # produced during the loop
-    question: str            # the raw user message
-    route: Literal["smalltalk", "clarify", "answer"]
-    search_query: str        # rewritten, standalone query
-    candidates: list[dict]   # retrieved + reranked chunks
+- `get_llm()` is `ChatAnthropic` on `CLAUDE_MODEL` (Haiku 4.5 by default).
+- `build_tools(ctx)` returns six LangChain `StructuredTool`s bound to the caller's resolved scope: `search_knowledge`, `list_tasks`, `create_task`, `create_tasks`, `update_task`, `summarize_project`. See [tools in agent.py and tools.py].
+- `prompt=system` is the persona (`persona.py`) — same voice and rules as the original TypeScript agent: confident, brief, tool-first, no narrated reasoning.
+- Only the last 5 turns of history are sent, keeping the prompt small; the full conversation is persisted by the frontend in Firestore, not by this backend.
+- `recursion_limit` caps tool round-trips (`MAX_RECURSION = 14`, headroom for a batch `create_tasks`). Hitting the cap raises `GraphRecursionError`, caught and turned into an honest "I ran out of steps" reply rather than a 500.
+
+This *is* the LangGraph state machine for the conversation: `create_react_agent` compiles a graph of (call the model) -> (run any tool calls) -> (call the model again) -> ... until the model responds with no tool calls. You do not see its nodes directly, but it is the same underlying mechanism as a hand-authored graph.
+
+## Inner loop: the retrieval subgraph
+
+When the agent calls `search_knowledge`, that tool runs `agentic_retrieve` in `backend/app/rag/retrieval.py` — a LangGraph graph you *do* author node by node, because retrieval quality is where hand control earns its keep.
+
+```python
+class _RetrieveState(TypedDict):
+    question: str
+    namespaces: list[str]
+    query: str
+    chunks: list[RetrievedChunk]
+    best: list[RetrievedChunk]
+    attempts: int
     grade: Literal["good", "weak"]
-    tries: int               # retrieval attempts so far
-    answer: str
-    citations: list[dict]
-    grounded: bool
 ```
 
-The trusted access fields (`workspace_id`, `namespace`, `allowed_project_ids`) are placed by FastAPI before the loop runs. The loop never changes them.
+Three nodes, one conditional edge:
 
-## The nodes
+```
+START -> rewrite -> retrieve -> assess ──good, or attempts>=MAX_ATTEMPTS──▶ END
+                        ▲                │
+                        └────weak, attempts<MAX_ATTEMPTS────┘
+```
 
-### Node 0 — route (the conversational check)
+(The grading node is named `assess`, not `grade` — LangGraph reserves the node name from colliding with a state key of the same name.)
 
-The first decision. Haiku classifies the message.
-
-- `smalltalk`: greetings, thanks, chit-chat. Answer directly, skip retrieval.
-- `clarify`: a real question but too vague to search. Ask one clarifying question back.
-- `answer`: a real, searchable question. Proceed.
-
-Why it exists: it stops the system running a full search and paying for retrieval on "hi". It also stops the model inventing an answer to a question it does not yet understand. This is the cheapest node and it saves the most waste.
+- **rewrite** — turn the raw question into a search-optimised query (Claude, `CLAUDE_FAST_MODEL`). On a retry it is told the previous query was weak and asked for a different angle.
+- **retrieve** — embed the query (Voyage), pull the top 20 candidates from the caller's accessible Pinecone namespaces, cross-encoder rerank (Voyage `rerank-2.5`) down to 4. See [retrieval-reranking.md](08-retrieval-reranking.md).
+- **assess** — Claude judges in one word whether the 4 chunks answer the question: `good` or `weak`.
+- The conditional edge retries (back to rewrite) on a weak grade, up to `MAX_ATTEMPTS = 2`. At the cap it returns whatever it has, `best` tracking the highest-scoring set seen across attempts even if the final attempt scored lower.
 
 ```python
-def route(state: RagState) -> RagState:
-    prompt = ROUTER_PROMPT.format(
-        history=state["chat_history"], message=state["question"]
-    )
-    label = haiku.invoke(prompt).content.strip()   # returns one word
-    return {**state, "route": label}
+def _build_graph():
+    graph = StateGraph(_RetrieveState)
+    graph.add_node("rewrite", _rewrite_node)
+    graph.add_node("retrieve", _retrieve_node)
+    graph.add_node("assess", _grade_node)
+    graph.add_edge(START, "rewrite")
+    graph.add_edge("rewrite", "retrieve")
+    graph.add_edge("retrieve", "assess")
+    graph.add_conditional_edges("assess", _should_continue, {"rewrite": "rewrite", END: END})
+    return graph.compile()
 ```
 
-### Node 1 — rewrite
+This subgraph is compiled once at import time and invoked fresh per search — it holds no state between calls.
 
-Turn the user message into a clean, standalone search query using the chat history.
+## The groundedness self-check
 
-Why it exists: users speak in context. "What about the second one?" is meaningless to a search engine. The rewrite resolves references from the history into a full query like "What are the cancellation terms for the second booking package?". Retrieval is only as good as the query it gets, so this node lifts everything downstream.
+After the outer agent produces a final answer, if any sources were gathered during the turn (`ctx.sources`, accumulated by `search_knowledge` and `summarize_project`), `agent.py` runs one more Claude call: does every claim in the answer trace to the sources? This is a plain function call (`check_grounded` in `retrieval.py`), not a LangGraph node — it runs once, after the agent loop has already finished, and never blocks a reply on failure. A "no" appends a caveat to the answer rather than rewriting it.
 
 ```python
-def rewrite(state: RagState) -> RagState:
-    prompt = REWRITE_PROMPT.format(
-        history=state["chat_history"], message=state["question"]
-    )
-    query = haiku.invoke(prompt).content.strip()
-    return {**state, "search_query": query}
+if sources and answer:
+    grounded = check_grounded(answer, sources)
+    if not grounded:
+        answer += "\n\n_Note: parts of this answer may not be fully backed by your documents._"
 ```
 
-### Node 2 — retrieve and rerank
-
-Search Pinecone with the access filter, then rerank with the cross-encoder. This node is the whole of [retrieval-reranking.md](08-retrieval-reranking.md), wrapped as one step.
-
-```python
-def retrieve(state: RagState) -> RagState:
-    q_vec = embeddings.embed_query(state["search_query"])
-    hits = index.query(
-        namespace=state["namespace"],
-        vector=q_vec,
-        top_k=20,
-        include_metadata=True,
-        filter={
-            "workspace_id": {"$eq": state["workspace_id"]},
-            "project_id": {"$in": state["search_project_ids"]},
-        },
-    )
-    candidates = [h["metadata"] for h in hits["matches"]]
-    top = rerank(state["search_query"], candidates, top_n=5)
-    return {**state, "candidates": top, "tries": state["tries"] + 1}
-```
-
-The access filter lives here, inside every retrieval, as Gate 2.
-
-### Node 3 — grade
-
-Haiku judges whether the retrieved chunks actually answer the question. Output is `good` or `weak`.
-
-Why it exists: this is the self-check that makes the system agentic. Plain RAG uses whatever it retrieved. Here, if the chunks do not contain the answer, the system knows, and it tries again with a different query instead of generating from thin air.
-
-```python
-def grade(state: RagState) -> RagState:
-    prompt = GRADE_PROMPT.format(
-        question=state["question"],
-        chunks=render(state["candidates"]),
-    )
-    verdict = haiku.invoke(prompt).content.strip()   # "good" or "weak"
-    return {**state, "grade": verdict}
-```
-
-### Node 4 — generate
-
-Write the answer using only the retrieved chunks, with citations. The prompt tells Haiku to answer strictly from the provided context and to cite the `doc_id` and section of each fact.
-
-```python
-def generate(state: RagState) -> RagState:
-    prompt = ANSWER_PROMPT.format(
-        question=state["question"],
-        context=render_with_ids(state["candidates"]),
-    )
-    result = haiku.invoke(prompt)
-    return {**state, "answer": result.content, "citations": extract_citations(result)}
-```
-
-### Node 5 — self-check (groundedness)
-
-Confirm every claim in the answer traces to a chunk. If a claim has no source, the answer is not grounded.
-
-Why it exists: this is the last guard against hallucination. Even with good chunks, a model sometimes adds a detail from memory. The check catches it. If ungrounded, either strip the unsupported claim or return "I do not have that in your documents".
-
-```python
-def self_check(state: RagState) -> RagState:
-    prompt = GROUNDED_PROMPT.format(
-        answer=state["answer"], context=render(state["candidates"])
-    )
-    grounded = haiku.invoke(prompt).content.strip() == "yes"
-    return {**state, "grounded": grounded}
-```
-
-## The edges (the control flow)
-
-Nodes do work. Edges decide the path. This is where the loop and the branches live.
+## Putting it together
 
 ```
-route ──smalltalk──▶ direct reply ──▶ END
-      ──clarify────▶ ask question ──▶ END
-      ──answer─────▶ rewrite
-
-rewrite ──▶ retrieve ──▶ grade
-
-grade ──good──▶ generate
-      ──weak──▶ (tries < 3) ? rewrite : generate_with_no_answer
-
-generate ──▶ self_check
-
-self_check ──grounded──▶ END (return answer + citations)
-           ──not grounded──▶ generate_with_no_answer ──▶ END
+user message
+  -> outer ReAct agent (LangGraph prebuilt)
+       -> decides: no tool needed?  -> answers directly, done
+       -> decides: search_knowledge -> inner retrieval subgraph (LangGraph, hand-authored)
+                                          rewrite -> retrieve -> assess -> (retry up to 2x)
+                                       -> returns graded chunks -> agent reads them, may call
+                                          another tool or produce the final answer
+       -> decides: a task tool      -> reads/writes Firestore, scoped by memberIds
+       -> ... repeats until a final answer with no tool calls, or MAX_RECURSION
+  -> groundedness self-check (plain function, only if sources were used)
+  -> {answer, steps, sources, cards}
 ```
 
-Two control points matter.
+Two caps matter, for the same reason: an unbounded loop is a cost and latency risk on a question the system cannot resolve. `MAX_RECURSION` bounds the outer tool loop; `MAX_ATTEMPTS` bounds the inner retrieval retry. Both fail toward an honest message to the user rather than a silent timeout.
 
-- The retrieval loop. `grade` sends weak results back to `rewrite` for another attempt, but only while `tries < 3`. The cap is essential. Without it the loop could spin forever on a question the documents cannot answer. At the cap, the system stops and returns an honest "I could not find this".
-- The groundedness gate. Even a generated answer must pass the self-check before it reaches the user.
+## Why Claude Haiku for every reasoning step
 
-## Wiring it in LangGraph
-
-```python
-from langgraph.graph import StateGraph, END
-
-g = StateGraph(RagState)
-g.add_node("route", route)
-g.add_node("rewrite", rewrite)
-g.add_node("retrieve", retrieve)
-g.add_node("grade", grade)
-g.add_node("generate", generate)
-g.add_node("self_check", self_check)
-
-g.set_entry_point("route")
-
-g.add_conditional_edges("route", lambda s: s["route"], {
-    "smalltalk": END,
-    "clarify": END,
-    "answer": "rewrite",
-})
-g.add_edge("rewrite", "retrieve")
-g.add_edge("retrieve", "grade")
-g.add_conditional_edges("grade", lambda s:
-    "generate" if s["grade"] == "good" or s["tries"] >= 3 else "rewrite",
-    {"generate": "generate", "rewrite": "rewrite"},
-)
-g.add_edge("generate", "self_check")
-g.add_conditional_edges("self_check", lambda s:
-    "done" if s["grounded"] else "generate",
-    {"done": END, "generate": "generate"},
-)
-
-app = g.compile()
-```
-
-## Why every reasoning node uses Haiku
-
-Routing, rewriting, grading, generating, and the self-check are all small, well-scoped tasks. Haiku handles them well and cheaply. Four of the five calls produce tiny output. Only generation writes real prose. This keeps a whole conversation to pennies. Cost breakdown in [cost-and-caching.md](11-cost-and-caching.md).
-
-## The three loops you asked for
-
-"Three loops" is the retrieval cap. Pass 1 is the first search. If graded weak, pass 2 rewrites and searches again. If still weak, pass 3 is the last attempt. After three, the system stops and answers honestly rather than looping without end. Three is a balance: enough to recover from a bad first query, few enough to keep latency and cost bounded.
+Tool selection, query rewriting, chunk grading, and the groundedness check are all small, well-scoped judgements — Haiku handles them well and cheaply. Only the final answer, and any tool-result summarising, produces real prose. Cost breakdown in [cost-and-caching.md](11-cost-and-caching.md).

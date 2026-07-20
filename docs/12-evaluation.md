@@ -1,5 +1,7 @@
 # 12 — Evaluation
 
+Not implemented in this codebase. There is no eval set, no LangSmith dataset, and no automated scoring wired up — this file is the methodology to follow when you build one, not a description of something running today. Retrieval was checked by hand during development (see the commit history: live queries against the real `slt-powerprox` Pinecone namespace, confirming the retrieval graph returns correctly reranked chunks), which is exactly the kind of ad hoc check this file argues you should not rely on long-term.
+
 You cannot improve what you cannot measure. A RAG chatbot has many moving parts, and a change to one part often quietly breaks another. Evaluation turns "it feels better" into a number you are able to track. This file shows what to measure and how.
 
 ## The two halves to measure
@@ -68,7 +70,7 @@ evaluate(
 )
 ```
 
-Because every run is named, you compare experiments directly: "top_n 5 vs top_n 3", "with reranker vs without", "bge-small vs bge-base". Change one thing, run the eval, read the delta. This is how you tune with evidence instead of vibes.
+Because every run is named, you compare experiments directly: "`KEEP=4` vs `KEEP=6`" (see `retrieval.py`), "with the Voyage reranker vs without", "`MAX_ATTEMPTS=2` vs `MAX_ATTEMPTS=3`". Change one thing, run the eval, read the delta. This is how you tune with evidence instead of vibes.
 
 ## The workflow
 

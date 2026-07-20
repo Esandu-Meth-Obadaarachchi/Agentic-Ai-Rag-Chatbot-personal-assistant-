@@ -8,6 +8,7 @@ Pinecone index and models.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -59,5 +60,18 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Cached singleton so the .env is read once per process."""
-    return Settings()
+    """Cached singleton so the .env is read once per process.
+
+    Also propagates the langsmith_* settings into the real process environment as
+    the LANGCHAIN_* names LangChain/LangGraph actually check for auto-tracing.
+    Without this, LANGSMITH_TRACING=true in .env would sit unused in the Settings
+    object — pydantic-settings reads .env into attributes, it does not export them
+    back to os.environ, and LangChain reads os.environ directly.
+    """
+    settings = Settings()
+    if settings.langsmith_tracing:
+        os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+        if settings.langsmith_api_key:
+            os.environ.setdefault("LANGCHAIN_API_KEY", settings.langsmith_api_key)
+        os.environ.setdefault("LANGCHAIN_PROJECT", settings.langsmith_project)
+    return settings

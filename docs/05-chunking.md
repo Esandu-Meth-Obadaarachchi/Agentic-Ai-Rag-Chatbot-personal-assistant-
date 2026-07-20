@@ -13,19 +13,21 @@ The craft of chunking is finding the middle.
 
 ## Size and overlap
 
-Use these defaults.
+This build uses characters, not tokens, and these sizes (matching the original TypeScript app exactly, so both read the same Pinecone data with the same chunk boundaries):
 
-- Chunk size: 500 to 800 tokens.
-- Overlap: 15 percent, so roughly 75 to 120 tokens.
+- Chunk size: 1000 characters.
+- Overlap: 200 characters (20%).
+
+See `backend/app/rag/chunker.py`.
 
 ### Why overlap
 
-A fact often sits on the boundary between two chunks. Without overlap, a hard split cuts a sentence or an idea in half, and neither chunk holds the whole thought. Overlap repeats the last slice of one chunk at the start of the next, so a boundary fact appears complete in at least one chunk. Fifteen percent is the common sweet spot. Enough to catch boundaries, not so much that you store the same text many times.
+A fact often sits on the boundary between two chunks. Without overlap, a hard split cuts a sentence or an idea in half, and neither chunk holds the whole thought. Overlap repeats the last slice of one chunk at the start of the next, so a boundary fact appears complete in at least one chunk.
 
 ```
-Chunk A:  [.................... tokens 0-700 ....................]
-Chunk B:              [.......... tokens 600-1300 ..........]
-                       ^-- the 600-700 overlap repeats here
+Chunk A:  [.................... chars 0-1000 ....................]
+Chunk B:              [.......... chars 800-1800 ..........]
+                       ^-- the 800-1000 overlap repeats here
 ```
 
 ## Structure-aware splitting
@@ -45,34 +47,33 @@ LangChain's `RecursiveCharacterTextSplitter` does exactly this. You give it a li
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=700,
-    chunk_overlap=105,          # ~15% of 700
+    chunk_size=1000,
+    chunk_overlap=200,
     separators=["\n\n", "\n", ". ", " ", ""],
-    length_function=len,        # swap for a token counter for token-based sizing
+    keep_separator=True,
 )
-chunks = splitter.split_text(document_text)
+chunks = [c for c in splitter.split_text(document_text) if c.strip()]
 ```
+
+This is the actual code in `chunker.py`, character-based rather than token-based — simple, and it matches the TypeScript app's own hand-rolled splitter exactly, so a chunk boundary computed by either side lands in the same place.
 
 For markdown or code, use the structure-aware variants (`MarkdownHeaderTextSplitter`, or a language-aware splitter) so you never cut through the middle of a code block or a table. A half a table is worse than useless.
 
-## The metadata is not optional
+## The metadata this build stores
 
-Every chunk carries metadata. This is where retrieval quality and security meet. Attach at least these.
+Every chunk carries metadata, attached at upsert time (`backend/app/rag/ingest.py`):
 
 ```python
 metadata = {
-    "workspace_id": workspace_id,   # security filter (Gate 2)
-    "project_id": project_id,       # security + cross-project compare
-    "doc_id": doc_id,               # ties the chunk back to its document
-    "chunk_index": i,               # order within the document
-    "title": document_title,        # for citations
-    "section": current_heading,     # for citations
-    "source": filename_or_url,      # provenance
-    "created_at": iso_timestamp,
+    "text": chunk,             # the chunk itself — retrieval returns this directly, no second lookup
+    "source": filename,        # provenance, shown as the citation
+    "project": project_name,   # which project this came from (shown when merging cross-project hits)
+    "type": doc_type,          # pdf | docx | markdown | code | text
+    "uploadedAt": iso_timestamp,
 }
 ```
 
-`workspace_id` and `project_id` power the access filter in [access-control.md](02-access-control.md). `doc_id`, `title`, and `section` power citations, so the answer is able to point back to a real place in a real document. Without citations the user cannot verify the answer, and trust collapses.
+There is no `workspace_id`, `doc_id` or `chunk_index` on the vector, because the namespace itself already is the project (see [namespaces-pinecone.md](06-namespaces-pinecone.md)) — the wall is structural, not a metadata field. Citations here are at the file level (`source`, `project`), not a section or heading; the original app does not track headings per chunk either.
 
 ## The other good practices
 
@@ -84,7 +85,7 @@ metadata = {
 
 ## Chunking and re-ingestion
 
-When a document changes you re-chunk the whole document, not a diff. Delete the old chunks by `doc_id` and write the new ones. Trying to patch individual chunks is fragile, because a small edit near the top shifts every boundary below it. Full re-chunk on change is simpler and correct. Idempotency detail is in [ingestion.md](07-ingestion.md).
+When a document changes, the right approach is to re-chunk the whole document and delete the old chunks before writing the new ones — patching individual chunks is fragile, because a small edit near the top shifts every boundary below it. This build does not implement that yet: `ingest_document` always inserts fresh vectors under new UUIDs, so re-uploading the same file twice adds a second copy rather than replacing the first. Worth knowing before you rely on re-ingestion in a demo. See [ingestion.md](07-ingestion.md) for what the endpoint does today.
 
 ## A note on advanced chunking
 

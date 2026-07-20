@@ -2,7 +2,7 @@
 
 This folder teaches the whole system, part by part. Read it top to bottom the first time. After that, treat each file as a reference.
 
-The goal is understanding, not copy-paste. Every file explains the why before the how, so you are able to defend each choice in an interview or a design review.
+The goal is understanding, not copy-paste. Every file explains the why before the how, and is written against the actual code in `../backend/app/`, so you are able to defend each choice in an interview or a design review — including the places this build simplified or diverged from a fuller design, which each file calls out explicitly rather than glossing over.
 
 ## Reading order
 
@@ -10,31 +10,34 @@ The goal is understanding, not copy-paste. Every file explains the why before th
 |---|------|----------------|
 | 00 | [overview.md](00-overview.md) | What RAG is, what "agentic" adds, and the mental model |
 | 01 | [architecture.md](01-architecture.md) | Every component and how data flows between them |
-| 02 | [access-control.md](02-access-control.md) | Roles, workspaces, projects, and the two security gates |
-| 03 | [data-model-firestore.md](03-data-model-firestore.md) | Firestore collections and why we skip Postgres |
-| 04 | [embeddings.md](04-embeddings.md) | The free embedding model and how vectors carry meaning |
-| 05 | [chunking.md](05-chunking.md) | Splitting documents, 15% overlap, and metadata |
-| 06 | [namespaces-pinecone.md](06-namespaces-pinecone.md) | Namespace strategy and cross-project comparison |
-| 07 | [ingestion.md](07-ingestion.md) | The write path: document in, vectors out |
-| 08 | [retrieval-reranking.md](08-retrieval-reranking.md) | Bi-encoder search plus cross-encoder reranking |
-| 09 | [agentic-loop.md](09-agentic-loop.md) | The LangGraph loop, step by step, with the why |
-| 10 | [langchain-langsmith.md](10-langchain-langsmith.md) | What each library does and how tracing works |
-| 11 | [cost-and-caching.md](11-cost-and-caching.md) | Haiku pricing and prompt caching |
-| 12 | [evaluation.md](12-evaluation.md) | How to measure whether the bot is any good |
-| 13 | [glossary.md](13-glossary.md) | Every term in one place |
-| 14 | [model-hosting.md](14-model-hosting.md) | Where the local models live and run after deploy |
+| 02 | [access-control.md](02-access-control.md) | Firebase ID tokens, `memberIds` isolation, the project-namespace wall |
+| 03 | [data-model-firestore.md](03-data-model-firestore.md) | Firestore collections this backend actually reads/writes |
+| 04 | [embeddings.md](04-embeddings.md) | Voyage `voyage-3.5`, and why hosted rather than local |
+| 05 | [chunking.md](05-chunking.md) | 1000/200 character chunking, matching the TypeScript app exactly |
+| 06 | [namespaces-pinecone.md](06-namespaces-pinecone.md) | Namespace-per-project and cross-project search by merge |
+| 07 | [ingestion.md](07-ingestion.md) | The synchronous write path, and what it does not do yet (no queue, no idempotency) |
+| 08 | [retrieval-reranking.md](08-retrieval-reranking.md) | Bi-encoder search plus Voyage `rerank-2.5` cross-encoder reranking |
+| 09 | [agentic-loop.md](09-agentic-loop.md) | The two nested LangGraph loops — the ReAct agent and the retrieval subgraph |
+| 10 | [langchain-langsmith.md](10-langchain-langsmith.md) | What each library actually does here, and how tracing turns on |
+| 11 | [cost-and-caching.md](11-cost-and-caching.md) | Where the tokens go, and why prompt caching isn't wired up yet |
+| 12 | [evaluation.md](12-evaluation.md) | How you would measure this system (not yet built) |
+| 13 | [glossary.md](13-glossary.md) | Every term, matched to what this build actually does |
+| 14 | [model-hosting.md](14-model-hosting.md) | Why every model call is a hosted API, none in-process |
+| 15 | [deploy-aws-ecs.md](15-deploy-aws-ecs.md) | Build → ECR → Secrets Manager → Fargate → ALB |
 
 ## The one-paragraph summary
 
-A user asks a question. The system checks who they are and which workspace and projects they are allowed to see. It rewrites the question into a clean search query, pulls candidate text chunks from Pinecone (filtered to their workspace and projects), reranks those chunks with a cross-encoder for accuracy, and asks Claude Haiku to answer using only those chunks, with citations. If the retrieved text is weak, the system loops back and tries again, up to three times. If it still has nothing solid, it says so instead of guessing.
+A user sends a message. FastAPI verifies their Firebase ID token and loads every workspace and project they belong to from Firestore. A LangGraph ReAct agent (Claude) decides what the message needs: nothing (small talk gets a direct reply), a knowledge search, or a task read/write. A knowledge search runs its own LangGraph loop — rewrite the question into a search query, retrieve a wide candidate set from Pinecone (only the namespaces of projects the user can see), rerank with a cross-encoder, grade whether the result actually answers the question, and retry with a reformulated query on a weak grade, up to two attempts. Once the agent has a final answer, a groundedness self-check confirms every claim traces back to a retrieved source.
 
 ## Stack at a glance
 
-- Orchestration: LangChain plus LangGraph
-- Model: Claude Haiku 4.5 (`claude-haiku-4-5`) through `ChatAnthropic`
-- Embeddings: free HuggingFace model, runs locally
-- Reranking: free cross-encoder, runs locally
-- Vector store: Pinecone, one namespace per workspace
-- Metadata and access store: Firebase Firestore
-- API: Python FastAPI
-- Tracing and evaluation: LangSmith
+- Orchestration: LangChain plus LangGraph — a ReAct tool-calling agent as the outer loop, a hand-authored 3-node graph (rewrite → retrieve → assess) as the inner retrieval loop.
+- Model: Claude Haiku 4.5 (`claude-haiku-4-5`) through `ChatAnthropic`, for both the agent and the retrieval helper calls.
+- Embeddings: Voyage `voyage-3.5`, 1024-dim, hosted API — matches the original TypeScript app's data.
+- Reranking: Voyage `rerank-2.5` cross-encoder, hosted API.
+- Vector store: Pinecone, one namespace per **project** (not per workspace).
+- Metadata and access store: Firebase Firestore, isolation via `memberIds` array-contains queries, not a separate memberships collection.
+- Auth: Firebase ID tokens, verified server-side with the Firebase Admin SDK.
+- API: Python FastAPI, containerised for AWS ECS Fargate.
+- Tracing: LangSmith, off by default — three env vars turn it on (see [langchain-langsmith.md](10-langchain-langsmith.md)).
+- Evaluation: not built yet — [evaluation.md](12-evaluation.md) is the method to follow, not a running system.

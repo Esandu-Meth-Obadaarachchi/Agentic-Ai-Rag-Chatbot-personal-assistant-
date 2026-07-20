@@ -2,97 +2,66 @@
 
 ## What a namespace is
 
-A Pinecone index is split into namespaces. A namespace is a partition inside the index. A query runs against exactly one namespace at a time and never sees vectors in another namespace. This one-namespace-per-query rule is the property we build security on.
+A Pinecone index is split into namespaces. A namespace is a partition inside the index. A query runs against exactly one namespace at a time (or, as shown below, several named namespaces merged client-side) and never sees vectors in a namespace it did not name. This one-namespace-per-query property is what this build's isolation rests on.
 
-## The design
-
-One namespace per workspace. Project lives in metadata.
+## The design: one namespace per project
 
 ```
-namespace = f"ws_{workspace_id}"
+namespace = project.ragNamespace     # e.g. "slt-powerprox", "hotel-odon-booking-com-airbnb-sites"
 
 vector metadata = {
-    "workspace_id": workspace_id,
-    "project_id": project_id,
-    ...
+    "text": chunk,
+    "source": filename,
+    "project": project_name,
+    "type": doc_type,
+    "uploadedAt": iso_timestamp,
 }
 ```
 
-So a workspace is a hard wall (the namespace) and a project is a soft filter (metadata) inside that wall.
+This is the same design the original TypeScript app uses, and it is why the Python backend reads the same index unchanged: every project's chunks already live in a namespace named after that project.
 
-## Why workspace is the namespace
+## Why project is the namespace, not workspace
 
-Two reasons, both important.
+A workspace can hold many projects, and access is often scoped per project — a member might see two of a workspace's five projects, not all five (see [access-control.md](02-access-control.md)). If the namespace were the workspace, a single Pinecone query could not exclude the three projects that member cannot see; you would need a metadata filter to do the real work, and a filter is something you could forget to apply. Making the project the namespace turns "which projects can this user search" into "which namespaces does the query even name" — the access list is enforced by which namespaces are queried, not by a filter layered on top.
 
-First, security. A query targets one namespace, and the server picks that namespace from the authenticated workspace (Gate 1 in [access-control.md](02-access-control.md)). A user in workspace A has no way to name workspace B's namespace, because the namespace string is built from their stored membership, not their request. The wall is structural, not a filter you might forget to apply.
+## Cross-project search: query several namespaces, merge by score
 
-Second, cross-project comparison. You asked for users to compare projects. Projects in the same workspace live in the same namespace, so a single query reaches all of them, and a metadata filter narrows to the chosen projects. If project were the namespace instead, comparing two projects would need two separate queries and a manual merge, which is slower and clumsier.
-
-## Why not project as the namespace
-
-If you made `ws_{id}__proj_{id}` the namespace, you would get physical project isolation, but you would lose easy cross-project search, because each query hits one namespace. For your requirement (compare projects within a workspace) that is the wrong trade. Workspace-as-namespace with project-as-metadata gives hard isolation where it matters (between workspaces) and flexibility where you want it (between projects in a workspace).
-
-Keep the composite-namespace option in your back pocket for a future case where a workspace has projects that must never be searched together, for example projects belonging to different end clients under one agency workspace. You are not there yet.
-
-## Querying with the filter
-
-Every query pairs the workspace namespace with a metadata filter for the allowed projects.
+A user's knowledge search often spans several projects at once — search runs across every project namespace they belong to, not one. Pinecone has no native multi-namespace query, so the backend queries each accessible namespace and merges the results by score:
 
 ```python
-results = index.query(
-    namespace=f"ws_{workspace_id}",         # Gate 1: the wall
-    vector=query_vector,
-    top_k=20,
-    include_metadata=True,
-    filter={                                # Gate 2: the filter
-        "workspace_id": {"$eq": workspace_id},
-        "project_id": {"$in": search_project_ids},
-    },
-)
+# backend/app/rag/vectorstore.py -> query_namespaces
+def query_namespaces(namespaces, vector, top_k=6):
+    per = max(2, ceil(top_k / len(namespaces)))
+    merged = []
+    for ns in namespaces:
+        merged.extend(query_namespace(ns, vector, per))   # a missing/empty ns must not fail the search
+    merged.sort(key=lambda c: c.score, reverse=True)
+    return merged[:top_k]
 ```
 
-`search_project_ids` is the intersection of what the user asked for and what they are allowed to see, computed in [access-control.md](02-access-control.md). The user cannot widen it.
-
-## Cross-project comparison in practice
-
-To compare two projects, pass both ids in the filter and let the reranker and model sort out the pieces.
-
-```python
-# user wants to compare project X and project Y, and has access to both
-search_project_ids = ["projX", "projY"]
-
-# one query returns chunks from both projects, ranked by relevance
-# the model then compares them in the answer, citing which project each fact came from
-```
-
-Because each chunk carries its `project_id` in metadata, the model is able to attribute every fact to the right project in its answer. That attribution is what makes a comparison trustworthy.
+The namespace list passed in is never wider than the user's resolved project scope (see [access-control.md](02-access-control.md)), so no amount of cross-project searching can reach a project the user is not a member of — there is no namespace string for it to query. Each returned chunk carries its `project` in metadata, so the model can attribute a fact to the right project when comparing two.
 
 ## Index configuration
 
-- Dimension: match your embedder. `bge-small-en-v1.5` gives 384.
-- Metric: cosine (with normalised embeddings, see [embeddings.md](04-embeddings.md)).
-- One index for the whole product. Split workspaces by namespace inside it, not by separate indexes. Separate indexes per workspace would be wasteful and hard to manage.
+- Dimension: 1024, matching `voyage-3.5` (see [embeddings.md](04-embeddings.md)).
+- Metric: cosine.
+- One index for the whole product (`second-brain` by default, `PINECONE_INDEX_NAME`). Every project gets its own namespace inside it, not a separate index — many small namespaces in one index is the efficient shape; a separate index per project would be wasteful and hard to manage.
 
 ## Upsert, update, delete
 
-- Upsert. Write chunk vectors with an id like `{doc_id}::{chunk_index}` so ids are stable and predictable.
-- Update. On a document change, delete the document's old chunks by filter, then upsert the new ones.
-- Delete. On document delete, delete by metadata filter on `doc_id`.
+- Upsert. `backend/app/rag/ingest.py` writes each chunk with a fresh UUID as its vector id, batched 100 at a time (`upsert_chunks`).
+- Namespace choice on upsert is the project being ingested into — resolved server-side from `load_project(uid, project_id)`, which itself enforces membership, so a user cannot ingest into a project they do not belong to.
 
 ```python
-# delete all chunks for a document (used on update and on delete)
-index.delete(
-    namespace=f"ws_{workspace_id}",
-    filter={"doc_id": {"$eq": doc_id}},
-)
+index.upsert(vectors=batch, namespace=project.rag_namespace)
 ```
 
 ## Serverless vs pod
 
-Pinecone serverless bills by usage and scales to zero-ish, which suits a product with many small workspaces. Start serverless. Move to pods only if you hit a scale or latency need you can measure.
+Pinecone serverless bills by usage and scales to zero-ish, which suits a product with many small project namespaces, most holding a modest number of chunks. Start serverless. Move to pods only if you hit a scale or latency need you can measure.
 
 ## The mental model to keep
 
-- Namespace = workspace = the wall you cannot climb.
-- Metadata filter = project = the door you open only for allowed projects.
-- One query, one namespace, many allowed projects. That is how compare-projects works while cross-workspace leakage stays impossible.
+- Namespace = project = the wall. A query only ever reaches the namespaces it explicitly names.
+- The namespace list handed to a query is never wider than the caller's resolved `memberIds` scope.
+- Cross-project search means querying several namespaces and merging by score client-side, not one query with a filter.

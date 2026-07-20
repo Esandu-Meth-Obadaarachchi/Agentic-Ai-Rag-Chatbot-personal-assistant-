@@ -2,118 +2,78 @@
 
 ## Why Firestore and not Postgres
 
-The earlier plan named Postgres by habit. A relational database makes membership joins clean, and it enforces foreign keys. Those are nice, not required. You already run Firestore, your team knows it, and it holds this data fine. Adding Postgres would mean a second database to deploy, back up, and reason about, for no real gain here. So we stay on Firestore.
+Firestore is a document store with no joins. You model relationships by denormalising — storing a small copy of related data where you need to read it. For access control this is genuinely helpful: a project document already carries its own `memberIds`, so one query answers "which of these can this user see" with no join. This build reuses the exact collections and fields the original TypeScript app already has in production, so the two stacks read and write the same data.
 
-Understand the trade-off so you are able to defend it. Firestore is a document store with no joins. You model relationships by denormalising, meaning you store a small copy of related data where you need to read it. For access control this is actually helpful, because the membership record already carries the role and the project list, so one read answers "who is this and what may they see". No join needed.
+The vector data does not live in Firestore. It lives in Pinecone. Firestore holds identity, membership, projects, tasks, and chat history (the last one written and read by the frontend, not this backend). Keep that split clear.
 
-The vector data does not live in Firestore. It lives in Pinecone. Firestore holds identity, access, document metadata, and chat history. Keep that split clear.
-
-## Collections
-
-Below is a clean structure. Adapt names to what you already have rather than duplicating.
+## Collections this build reads and writes
 
 ### workspaces
 
 ```
 workspaces/{workspaceId}
   name: string
+  emoji: string
+  ownerId: string
+  memberIds: array<string>       // every uid with any access — the isolation query key
+  members: array<{uid, name, email, role, scope}>
   createdAt: timestamp
-  ownerId: string        // user id of the owner
 ```
 
 ### projects
 
 ```
 projects/{projectId}
-  workspaceId: string    // parent workspace
+  workspaceId: string             // parent workspace
   name: string
+  ragNamespace: string            // the project's own Pinecone namespace, e.g. "slt-powerprox"
+  memberIds: array<string>        // full-access workspace members + anyone scoped to this project
   createdAt: timestamp
 ```
 
-Storing `workspaceId` on the project lets you list a workspace's projects with one query and confirm a project belongs to the workspace before searching it.
+`ragNamespace` is the load-bearing field for retrieval: `search_knowledge` builds its namespace list straight from the accessible projects' `ragNamespace` values (see [namespaces-pinecone.md](06-namespaces-pinecone.md)).
 
-### memberships
-
-This is the heart of access control. One document per user per workspace.
+### tasks
 
 ```
-memberships/{membershipId}      // id = `${userId}_${workspaceId}` for a direct lookup
-  userId: string
-  workspaceId: string
-  role: string                  // owner | admin | member | viewer
-  projectIds: array<string>     // projects this user may see in this workspace
-  createdAt: timestamp
-```
-
-Using `${userId}_${workspaceId}` as the document id means Gate 1 is a single `get`, not a query. Fast and cheap.
-
-If you already store role and project access in a different shape (for example a `members` subcollection under each workspace), keep it. The only requirement is: given a `userId` and a `workspaceId`, you are able to read the role and the allowed project ids in one cheap operation.
-
-### documents
-
-Metadata about each ingested file. The text and vectors live in Pinecone, not here.
-
-```
-documents/{docId}
+tasks/{taskId}
   workspaceId: string
   projectId: string
+  parentId: string | null         // subtask nesting
   title: string
-  source: string          // filename or url
-  contentHash: string     // to detect changes and stay idempotent
-  status: string          // queued | processing | ready | failed
-  chunkCount: number
-  createdAt: timestamp
-  updatedAt: timestamp
+  status: string                  // todo | in_progress | blocked | done (+ project-defined custom ones)
+  priority: string                // low | med | high | urgent
+  assignees: array<{id, name, avatar}>
+  assigneeId, assigneeName: string  // legacy single-assignee fields, still read
+  dueDate: string | null           // yyyy-mm-dd
+  memberIds: array<string>         // inherited from the owning project at creation time
+  order, createdAt, updatedAt, createdBy: ...
 ```
 
-The `status` field drives the UI. The `contentHash` field powers idempotent re-ingestion (see [ingestion.md](07-ingestion.md)).
+There is no separate `memberships` collection in this data model. Membership is denormalised directly onto `workspaces.memberIds`, `projects.memberIds` and `tasks.memberIds` — every doc a user can see already lists their uid, so isolation is one `array-contains` query, not a join through a membership table. Same reasoning as above, applied consistently through every collection. Role (owner/admin/member/viewer) and per-project scope live on `workspace.members[]`, computed once when someone is invited or their access changes; this backend does not recompute it, only reads the already-denormalised `memberIds`.
 
-### chatSessions and messages
+### Chat history — not this backend's concern
 
-```
-chatSessions/{sessionId}
-  userId: string
-  workspaceId: string
-  projectIds: array<string>
-  createdAt: timestamp
-
-chatSessions/{sessionId}/messages/{messageId}
-  role: string            // user | assistant
-  content: string
-  citations: array        // [{docId, title, section}]
-  createdAt: timestamp
-```
-
-LangChain has a Firestore chat history integration, so the loop reads and writes this collection through a standard interface rather than raw Firestore calls. See [langchain-langsmith.md](10-langchain-langsmith.md).
+The frontend persists conversations to Firestore (`chats` + `chatMessages`, keyed to the user, global across workspaces). This backend does not read or write those collections — `/api/chat` is stateless per request, given only the last 5 turns the frontend sends in the request body. Keep that boundary in mind: if you go looking for where a past conversation is stored, it is in the frontend's data layer, not here.
 
 ## The access-control read, in code
 
 ```python
-from google.cloud import firestore
-
-db = firestore.Client()
-
-def resolve_scope(user_id: str, workspace_id: str):
-    doc_id = f"{user_id}_{workspace_id}"
-    snap = db.collection("memberships").document(doc_id).get()
-    if not snap.exists:
-        return None                      # user not in this workspace -> 403
-    data = snap.to_dict()
-    return {
-        "role": data["role"],
-        "allowed_project_ids": data.get("projectIds", []),
-        "namespace": f"ws_{workspace_id}",
-    }
+# backend/app/data/firestore.py
+def load_user_scope(uid: str) -> tuple[list[dict], list[dict]]:
+    workspaces = query("workspaces", where memberIds array_contains uid)
+    projects   = query("projects",   where memberIds array_contains uid)
+    return workspaces, projects
 ```
 
-That one function is Gate 1. Everything downstream uses its output and never re-reads the client.
+That one function (plus `fetch_accessible_tasks`, the same query against `tasks`) is the entire access-control read. Everything downstream — the agent's tool set, the namespaces it can search, the tasks it can list — is built from this result and never re-reads the client. Detail on why this is safe in [access-control.md](02-access-control.md).
 
 ## Indexing note
 
-Firestore needs a composite index for queries that filter on more than one field, for example listing `documents` by `workspaceId` and `projectId` and `status`. Create those indexes up front. Firestore prompts you with the exact index to add the first time a query needs one.
+Firestore needs a composite index for any query filtering on more than one field. The `array-contains` queries here filter on a single field (`memberIds`), so they need no composite index. If you add a query that filters `memberIds` and, say, `status` together, Firestore will prompt you with the exact index to add the first time that query runs.
 
-## What not to store here
+## What this backend does not store
 
 - No vectors. They go to Pinecone.
-- No raw document text longer than you need for display. Pinecone chunks hold the text used for answers.
+- No `documents` collection tracking ingestion status or content hashes — ingestion is synchronous and either succeeds within the request or returns an error (see [ingestion.md](07-ingestion.md)).
 - No secrets or API keys.

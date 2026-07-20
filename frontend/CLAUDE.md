@@ -2,6 +2,17 @@
 
 Read this first in any session. It is the map of the codebase and the rules for changing it.
 
+> **This copy lives in `agentic-rag-aws/frontend/` and its AI routes are proxies, not the brain.**
+> `api/chat`, `api/ingest` and `api/related` forward the request (Firebase ID token included) to
+> the FastAPI + LangGraph backend in `../backend/` (`RAG_API_URL`, default `http://localhost:8000`)
+> and return its response unchanged. The retrieval loop, the agent, the tools, Voyage, and the
+> Pinecone/Firestore reads described below as living in `src/lib/ai/**` now live in the Python
+> backend instead — see `../docs/` and `../backend/README.md`. Everything else in this file
+> (views, data layer, sharing, design system) is unchanged and still accurate for this copy.
+> `api/assign`, `api/members` and `api/calendar/*` were not ported and still run in Next.js here.
+> The original app at `second-brain/` (a separate folder, untouched by this rebuild) still runs
+> its RAG entirely in Next.js as described below.
+
 ## What this is
 
 Shipped as **Lune AI — Your Personal Workspace** (product name; the codebase/package is still `second-brain`). An AI-native project + knowledge manager. Notion-meets-Linear feel: dense, dark, keyboard-friendly. Pillars on one backend:

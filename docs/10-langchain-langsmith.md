@@ -6,27 +6,30 @@ Three tools with three jobs. People blur them together. Keep them apart.
 
 LangChain is a library of standard interfaces for the parts of an LLM app: loaders, splitters, embedding wrappers, vector store wrappers, retrievers, and model wrappers. Its value is that each part has one interface, so you swap implementations without rewriting the rest. Switch the embedder or the vector store and the code around it barely changes.
 
-What you use from LangChain here:
+What this build actually uses from LangChain (`backend/app/rag/`):
 
-- Document loaders. Read PDF, Word, text into a common `Document` shape.
-- Text splitters. `RecursiveCharacterTextSplitter` for chunking (see [chunking.md](05-chunking.md)).
-- Embeddings wrapper. `HuggingFaceEmbeddings` around the bge model (see [embeddings.md](04-embeddings.md)).
-- Vector store wrapper. `PineconeVectorStore` around your index, exposed as a retriever.
-- Reranker. `CrossEncoderReranker` as a compression step (see [retrieval-reranking.md](08-retrieval-reranking.md)).
-- Model wrapper. `ChatAnthropic` for Haiku.
-- Chat history. `FirestoreChatMessageHistory` to read and write turns.
+- Text splitter. `RecursiveCharacterTextSplitter` for chunking, 1000/200 (`chunker.py`; see [chunking.md](05-chunking.md)).
+- Embeddings wrapper. `VoyageAIEmbeddings` around `voyage-3.5` (`embeddings.py`; see [embeddings.md](04-embeddings.md)) — not a HuggingFace wrapper; this build calls the hosted Voyage API.
+- Reranker. `VoyageAIRerank` used directly as a `ContextualCompressionRetriever`-style compressor (`rerank.py`; see [retrieval-reranking.md](08-retrieval-reranking.md)) — again Voyage's hosted `rerank-2.5`, not a local cross-encoder.
+- Vector store. Talked to directly through the official `pinecone` client (`vectorstore.py`), not LangChain's `PineconeVectorStore` wrapper — the read path merges hits across several project namespaces in one call, which the single-namespace VectorStore interface does not express cleanly. See [namespaces-pinecone.md](06-namespaces-pinecone.md) for why.
+- Model wrapper. `ChatAnthropic` for both the agent (`CLAUDE_MODEL`, Haiku 4.5 by default) and the retrieval helper calls (`CLAUDE_FAST_MODEL`).
+- Agent runtime. `langgraph.prebuilt.create_react_agent` — the tool-calling loop itself, not a hand-authored LangChain chain. See [agentic-loop.md](09-agentic-loop.md).
+- Tools. Six `StructuredTool`s (`tools.py`) with Pydantic `args_schema`s, including a recursive schema for nested subtasks in `create_tasks`.
+
+There is no chat-history integration in this codebase (no `FirestoreChatMessageHistory` or similar) — the frontend persists conversations to Firestore itself; this backend is stateless per request, given only the last 5 turns in the request body.
 
 ```python
 from langchain_anthropic import ChatAnthropic
 
-haiku = ChatAnthropic(
+llm = ChatAnthropic(
     model="claude-haiku-4-5",
+    api_key=settings.anthropic_api_key,
     max_tokens=1024,
-    temperature=0,          # deterministic routing/grading; raise a little for generation if wanted
+    timeout=60,
 )
 ```
 
-Think of LangChain as the socket set. Standard sockets, many tools fit.
+Think of LangChain as the socket set. Standard sockets, many tools fit — though this build reaches past a couple of the standard sockets (the vector store wrapper, the chat-history integration) where the exact shape of the isolation model or the request/response contract mattered more than reuse.
 
 ## LangGraph — the control flow
 
@@ -44,15 +47,17 @@ An agentic loop has many steps. When an answer is wrong, the fault could be in r
 
 ### Turning it on
 
-It is mostly environment variables. LangChain and LangGraph send traces automatically once these are set.
+Set three values in `backend/.env`:
 
 ```bash
-export LANGCHAIN_TRACING_V2=true
-export LANGCHAIN_API_KEY=your_langsmith_key
-export LANGCHAIN_PROJECT=agentic-rag
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your_langsmith_key
+LANGSMITH_PROJECT=agentic-rag-aws
 ```
 
-With those set, every LangGraph run appears in the LangSmith project as a trace tree: one node per step, each expandable to show the prompt and the response.
+`config.get_settings()` reads these through `pydantic-settings` and, if tracing is on, propagates them into the real process environment as the `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` / `LANGCHAIN_PROJECT` names LangChain and LangGraph actually check at call time. This propagation step exists because `pydantic-settings` only loads `.env` into the `Settings` object's attributes — it does not export them back to `os.environ`, and LangChain's tracing check reads `os.environ` directly, not any app object. `get_settings()` runs once at app startup, before any request is served, so the real env vars are in place before the first agent or retrieval call.
+
+With tracing on, every LangGraph run — the retrieval subgraph and the outer ReAct agent — appears in the LangSmith project as a trace tree: one node per step, each expandable to show the prompt and the response.
 
 ### What to look at in a trace
 

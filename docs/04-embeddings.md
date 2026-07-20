@@ -12,54 +12,47 @@ Once text is a vector, "relevant" becomes "close". You measure closeness with co
 
 The key point: search quality is capped by embedding quality. If the embedder maps two related sentences far apart, no reranker or model downstream will recover them, because they never got retrieved. Choose a decent embedder.
 
-## The free model to use
+## The model this build uses: Voyage voyage-3.5
 
-You said use a free model. Good choices, all free and all run locally through HuggingFace:
+This build uses Voyage AI's `voyage-3.5`, a hosted embedding model, reached over an API with a key. It is the same choice the original TypeScript app made, and it is the reason the two share a Pinecone index: the vectors already stored were written by `voyage-3.5`, so the Python service must embed with the same model to read them.
 
-| Model | Dimensions | Notes |
-|-------|:----------:|-------|
-| `BAAI/bge-small-en-v1.5` | 384 | Strong quality for its size. Recommended default. |
-| `BAAI/bge-base-en-v1.5` | 768 | Better quality, heavier. Use if 8GB RAM allows. |
-| `sentence-transformers/all-MiniLM-L6-v2` | 384 | Lighter, slightly weaker. Fine fallback. |
-| `intfloat/e5-small-v2` | 384 | Similar tier to bge-small. |
+| Property | Value |
+|----------|-------|
+| Model | `voyage-3.5` |
+| Dimensions | 1024 (its default) |
+| Access | hosted API, `VOYAGE_API_KEY` |
+| Input type | `query` for searches, `document` for ingestion |
 
-Recommendation: `BAAI/bge-small-en-v1.5`. It is small enough for an M1 with 8GB RAM, fast, and good. Free, no API key, runs on your machine.
+Voyage is Anthropic's recommended embedding partner. Claude has no embedding model of its own, so pairing Claude (generation) with Voyage (retrieval) is the standard combination.
 
-One detail with bge and e5 models: they expect a short instruction prefix. For bge, prefix stored passages as they are and prefix queries with a retrieval instruction. The sentence-transformers wrapper and LangChain handle this if you set it, but know it exists, because forgetting it costs you a few points of accuracy.
+One detail worth knowing: Voyage embeds queries and documents with a different `input_type`. LangChain's `VoyageAIEmbeddings` sets this for you — `embed_query` uses `query`, `embed_documents` uses `document`. Getting this right costs a few points of accuracy if you skip it.
 
 ## Using it through LangChain
 
 ```python
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_voyageai import VoyageAIEmbeddings
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-small-en-v1.5",
-    model_kwargs={"device": "cpu"},          # or "mps" for Apple Silicon acceleration
-    encode_kwargs={"normalize_embeddings": True},  # needed for cosine similarity
+embeddings = VoyageAIEmbeddings(
+    model="voyage-3.5",        # 1024-dim by default
+    api_key=settings.voyage_api_key,
+    batch_size=96,             # documents per request at ingest time
 )
 ```
 
-`normalize_embeddings=True` scales every vector to length 1. Cosine similarity assumes this, so do not skip it.
-
-Load this object once at startup and reuse it. Creating it downloads the model the first time, then caches it locally.
+See `backend/app/rag/embeddings.py`. Build this object once (it is cached with `lru_cache`) and reuse it. Each call is an HTTPS request to Voyage, so batch the document side at ingest time.
 
 ## Dimensions must match everywhere
 
-The dimension of your embedding model is fixed. `bge-small` outputs 384 numbers. Your Pinecone index must be created with dimension 384 and metric cosine. If you ever switch embedders to one with a different dimension, you must create a new index and re-embed everything. The old vectors are not compatible. Decide the embedder before you create the index.
-
-```python
-# Pinecone index config must match the embedder
-# dimension = 384, metric = "cosine"  for bge-small-en-v1.5
-```
+The dimension is fixed. `voyage-3.5` outputs 1024 numbers. The Pinecone index must be created with dimension 1024 and metric cosine. If you ever switch embedders to one with a different dimension, you must create a new index and re-embed everything — the old vectors are not compatible. Decide the embedder before you create the index.
 
 ## Query vector and passage vector
 
 At ingestion you embed each chunk (a passage) and store the vector. At query time you embed the user's search query with the same model, then ask Pinecone for the nearest passage vectors. Same model on both sides. Mixing two embedders across the two sides gives nonsense, because their vector spaces do not line up.
 
-## Why not a paid embedding API
+## Why a hosted model, not a local one
 
-Paid APIs like OpenAI or Voyage are a little stronger and save you from running a model. You do not need them. A local bge model is free, private (text never leaves your machine to be embedded), and good enough that the cross-encoder reranker downstream closes most of the quality gap. Keep the money for the generation calls.
+A local open-source embedder (bge, e5, MiniLM through HuggingFace) is free and private, and is a fine choice for a from-scratch build. This project chose the hosted Voyage model for two concrete reasons: it matches the existing TypeScript app exactly, so the Python service reads the data already in Pinecone with no re-embedding; and it keeps the container small and CPU-light, since no model weights load into the process — everything heavy runs on Voyage's side. The trade is a small per-call cost and a network hop, both minor next to the generation calls.
 
 ## Cost and speed
 
-Embedding is cheap. On an M1 you embed hundreds of chunks per second for a small model. The cost is CPU or GPU time, not dollars. This is why ingestion is not a budget concern. The budget concern is the Haiku calls at query time, covered in [cost-and-caching.md](11-cost-and-caching.md).
+Voyage embedding calls are cheap relative to generation. Ingestion batches documents (up to 96 per request) so a normal upload finishes in a second or two. The budget concern is the Claude calls at query time, covered in [cost-and-caching.md](11-cost-and-caching.md), not embedding.

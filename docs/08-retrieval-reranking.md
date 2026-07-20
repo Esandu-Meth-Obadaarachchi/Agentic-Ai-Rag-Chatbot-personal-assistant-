@@ -23,7 +23,7 @@ The weakness: you cannot precompute anything. Every query-document pair is a fre
 Use each for what it is good at.
 
 1. Retrieval (bi-encoder). Search Pinecone with the query vector. Pull the top 20 candidates fast. This is recall: cast a wide net so the right chunks are somewhere in the 20.
-2. Reranking (cross-encoder). Score each of the 20 candidates against the query with the cross-encoder. Keep the top 4 or 5. This is precision: put the truly relevant chunks at the top.
+2. Reranking (cross-encoder). Score each of the 20 candidates against the query with the cross-encoder. Keep the top 4. This is precision: put the truly relevant chunks at the top.
 
 Wide net, then sharp sort. The bi-encoder finds candidates cheaply. The cross-encoder orders them accurately. Together they beat either alone.
 
@@ -31,70 +31,61 @@ Wide net, then sharp sort. The bi-encoder finds candidates cheaply. The cross-en
 query
   -> bi-encoder search in Pinecone  -> 20 candidate chunks (recall)
   -> cross-encoder scores each pair -> reorder            (precision)
-  -> keep top 4-5                   -> feed to Haiku
+  -> keep top 4                     -> feed to Claude
 ```
 
-## The free cross-encoder to use
+The constants live in `backend/app/rag/retrieval.py`: `CANDIDATES = 20`, `KEEP = 4`.
 
-All free, all local through HuggingFace `sentence-transformers`.
+## The reranker this build uses: Voyage rerank-2.5
 
-| Model | Notes |
-|-------|-------|
-| `cross-encoder/ms-marco-MiniLM-L-6-v2` | Small, fast, strong. Recommended default. |
-| `cross-encoder/ms-marco-MiniLM-L-12-v2` | A bit stronger, a bit slower. |
-| `BAAI/bge-reranker-base` | Strong reranker, heavier. Use if RAM allows. |
+This build uses Voyage's `rerank-2.5`, a hosted cross-encoder reached over the same API as the embeddings. Same choice as the original TypeScript app. It reads the query and each candidate together and returns a relevance score per candidate.
 
-Recommendation: `cross-encoder/ms-marco-MiniLM-L-6-v2`. Scoring 20 short pairs takes a fraction of a second on an M1, so it fits the query path without hurting latency.
+| Property | Value |
+|----------|-------|
+| Model | `rerank-2.5` |
+| Access | hosted API, `VOYAGE_API_KEY` |
+| Input | the query plus the list of candidate texts |
+| Output | a relevance score per candidate, best first |
 
 ## Using it
 
-Directly with sentence-transformers:
+Through LangChain's `VoyageAIRerank`, which scores a list of documents against the query:
 
 ```python
-from sentence_transformers import CrossEncoder
+from langchain_core.documents import Document
+from langchain_voyageai import VoyageAIRerank
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")  # load once at startup
-
-def rerank(query, candidates, top_n=5):
-    pairs = [(query, c["text"]) for c in candidates]
-    scores = reranker.predict(pairs)             # one score per pair
-    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-    return [c for c, s in ranked[:top_n]]
-```
-
-Or through LangChain, which wraps the same model as a compressor on top of the Pinecone retriever:
-
-```python
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain.retrievers.document_compressors import CrossEncoderReranker
-
-cross_encoder = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-compressor = CrossEncoderReranker(model=cross_encoder, top_n=5)
-
-retriever = ContextualCompressionRetriever(
-    base_compressor=compressor,
-    base_retriever=pinecone_retriever,   # returns the top 20 with the access filter applied
+reranker = VoyageAIRerank(
+    model="rerank-2.5",
+    voyage_api_key=settings.voyage_api_key,   # NB: this field has no api_key alias
+    top_k=4,
 )
+
+def rerank(query, texts):
+    docs = [Document(page_content=t, metadata={"_i": i}) for i, t in enumerate(texts)]
+    ranked = reranker.compress_documents(docs, query)
+    return [(d.metadata["_i"], d.metadata["relevance_score"]) for d in ranked]
 ```
 
-The base retriever must already carry the namespace and the metadata filter, so the access rules hold before reranking. Reranking never widens the result set, it only reorders and trims.
+See `backend/app/rag/rerank.py`. One gotcha the build hit: `VoyageAIRerank` names its key field `voyage_api_key` with no `api_key` alias, unlike `VoyageAIEmbeddings`. Passing `api_key=` there is silently dropped and the client raises `AuthenticationError`.
+
+The candidate list handed to the reranker must already be scoped — it comes from the project namespaces the user is allowed to search (see [access-control.md](02-access-control.md)). Reranking never widens the result set, it only reorders and trims.
 
 ## Why not skip the bi-encoder and only use the cross-encoder
 
-Because the cross-encoder cannot search. It scores pairs you already have. You still need the bi-encoder to fetch the candidate 20 from a corpus of thousands or millions. The cross-encoder only sharpens a short list. No first stage means nothing to rank.
+Because the cross-encoder cannot search. It scores pairs you already have. You still need the bi-encoder to fetch the candidate 20 from a corpus of thousands. The cross-encoder only sharpens a short list. No first stage means nothing to rank.
 
 ## Why not skip the cross-encoder
 
-You can, and plain vector search returns something. But the top vector-search result is often not the best answer, because the bi-encoder judged relevance from vectors made in isolation. The cross-encoder routinely promotes a better chunk from position 8 to position 1. For a small cost in latency you get a real jump in answer quality. This is the highest-value accuracy lever after chunking, which is why you asked for it.
+You can, and plain vector search returns something. But the top vector-search result is often not the best answer, because the bi-encoder judged relevance from vectors made in isolation. The cross-encoder routinely promotes a better chunk from position 8 to position 1. For a small cost in latency you get a real jump in answer quality. This is the highest-value accuracy lever after chunking.
 
 ## Tuning the numbers
 
-- `top_k` at retrieval: 20 is a good start. Higher recall, more reranking cost. Raise if evaluation shows the right chunk is sometimes missing from the 20.
-- `top_n` after rerank: 4 or 5. Enough context for the model, few enough to keep the prompt tight and cheap.
+- `CANDIDATES` at retrieval: 20 is a good start. Higher recall, more reranking cost. Raise if evaluation shows the right chunk is sometimes missing from the 20.
+- `KEEP` after rerank: 4. Enough context for the model, few enough to keep the prompt tight and cheap.
 
 Measure these with the evaluation set in [evaluation.md](12-evaluation.md). Do not guess.
 
-## Optional: hybrid search
+## Why a hosted reranker, not a local one
 
-Dense vector search sometimes misses exact keywords, codes, or names. A hybrid of dense plus sparse (keyword) retrieval catches both. Pinecone supports sparse-dense vectors. Add this only if evaluation shows you are missing exact-match queries. Start dense-only plus the cross-encoder.
+A local cross-encoder (a `ms-marco-MiniLM` or `bge-reranker` through HuggingFace) is free and a fine from-scratch choice. This build uses Voyage `rerank-2.5` to match the TypeScript app and to keep the container light — no model weights in the process. The trade is a network hop and a small fee per rerank, both minor next to generation.

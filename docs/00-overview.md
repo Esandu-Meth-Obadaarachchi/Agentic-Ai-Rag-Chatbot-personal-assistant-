@@ -49,7 +49,7 @@ Everything else in this documentation is detail hanging off that model. Access c
 
 You have workspaces, and each workspace has projects. People in one workspace must never see another workspace's data. That is a hard rule, so the retrieval step is wrapped in strict access control (see [access-control.md](02-access-control.md)). Within a workspace, people often want to compare projects, so the namespace design keeps that easy (see [namespaces-pinecone.md](06-namespaces-pinecone.md)).
 
-You also want low cost, so every reasoning step runs on Claude Haiku, the smallest and cheapest current model. Haiku is strong enough for routing, rewriting, grading, and grounded generation. The heavy lifting on relevance is done by a local cross-encoder, which is free to run.
+You also want low cost, so every reasoning step runs on Claude Haiku, the smallest and cheapest current model. Haiku is strong enough for tool selection, query rewriting, chunk grading, and grounded generation. The heavy lifting on relevance is done by Voyage's `rerank-2.5` cross-encoder, a hosted call rather than a model running in-process — see [model-hosting.md](14-model-hosting.md) for what that trade-off actually costs.
 
 ## What good looks like
 

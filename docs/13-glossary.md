@@ -20,7 +20,7 @@ Citation. A pointer from a fact in the answer back to the document and section i
 
 Embedding. A list of numbers representing the meaning of a piece of text. Similar meaning maps to nearby vectors.
 
-Vector. The list of numbers itself. Its length is the model's dimension (for example 384 for bge-small).
+Vector. The list of numbers itself. Its length is the model's dimension — 1024 for this build's embedder, `voyage-3.5`.
 
 Bi-encoder. A model that reads one text at a time and outputs one vector. Fast, used to embed and search at scale. Your embedding model is a bi-encoder.
 
@@ -42,39 +42,35 @@ Overlap. Repeating the end of one chunk at the start of the next so a fact on th
 
 Structure-aware splitting. Splitting on natural boundaries (headings, paragraphs, sentences) before falling back to raw character counts.
 
-Metadata. Extra fields stored with each chunk (workspace id, project id, doc id, title, section). Powers the access filter and citations.
+Metadata. Extra fields stored with each chunk — `text`, `source`, `project`, `type`, `uploadedAt` in this build. Powers citations; the isolation itself comes from the namespace, not a metadata filter (see Namespace, below).
 
 ## Storage
 
 Pinecone. The managed vector database holding chunk vectors and their metadata.
 
-Namespace. A partition inside a Pinecone index. A query hits one namespace only. We use one per workspace, which makes it the security wall.
+Namespace. A partition inside a Pinecone index. A query hits only the namespace(s) it explicitly names. This build uses one namespace per project (`project.ragNamespace`), which makes the project the security wall — see [namespaces-pinecone.md](06-namespaces-pinecone.md).
 
 Index. The whole Pinecone store for the product. Split into namespaces inside.
 
 Upsert. Insert or overwrite vectors. Used at ingestion.
 
-Metadata filter. A condition on a query that keeps only vectors matching given fields. Our second security gate (project scope).
+Metadata filter. A condition on a query that keeps only vectors matching given fields. Not used as a security gate in this build — the project namespace is the whole wall; metadata (`source`, `project`, `type`) is for citations only.
 
 Firestore. The Firebase document database holding users, roles, project access, document metadata, and chat history. Not vectors.
 
-Idempotent. Running the same operation twice has the same effect as running it once. We get this on ingestion with a content hash.
+Idempotent. Running the same operation twice has the same effect as running it once. Not implemented on ingestion in this build — re-uploading the same file adds a second copy of its chunks rather than replacing the first (see [ingestion.md](07-ingestion.md)).
 
 ## Access control
 
-Workspace. The top-level tenant. Maps to a Pinecone namespace. Hard isolation boundary.
+Workspace. The top-level tenant a user belongs to. Holds projects. Not the Pinecone isolation boundary in this build — the project is (see Project, below).
 
-Project. A grouping inside a workspace. Maps to chunk metadata. Users compare projects within their workspace.
+Project. A grouping inside a workspace, and this build's actual isolation boundary: each project owns one Pinecone namespace. Users compare projects within their workspace by searching several accessible namespaces and merging hits by score.
 
-Role. What a member is allowed to do in a workspace: owner, admin, member, viewer.
+`memberIds`. An array field on every workspace, project and task document listing every uid allowed to see it. The isolation mechanism this build actually uses — an `array-contains` Firestore query on this field is the entire access-control read. See [access-control.md](02-access-control.md).
 
-Membership. The stored record linking a user to a workspace, with their role and project access.
+Role. What a member is allowed to do in a workspace: owner, admin, member, viewer. Stored on `workspace.members[]`, not read or enforced by this backend directly — this backend trusts `memberIds` as the already-computed result of role and scope.
 
-Gate 1 (authorisation). The server check that resolves the user's workspace, role, and allowed projects from stored records before the loop runs.
-
-Gate 2 (metadata filter). The per-query filter on workspace and project applied inside every Pinecone search. Defence in depth.
-
-JWT. A signed token proving who the user is. The client cannot forge the user id inside it.
+Firebase ID token. A signed JWT Firebase issues on sign-in. The client sends it as `Authorization: Bearer <token>`; the backend verifies it with the Firebase Admin SDK to get a trusted uid. The client cannot forge the uid inside it. This is this build's actual authentication mechanism (see `security/firebase.py`).
 
 ## The loop
 
@@ -90,13 +86,15 @@ Node. One step in the loop (route, rewrite, retrieve, grade, generate, self-chec
 
 Edge. The rule deciding which node runs next based on the state. Where branching and looping live.
 
-Router. The first node, which classifies the message as small talk, a clarify, or a real question.
+Router. Not a node in this build. There is no explicit classifier step — the outer ReAct agent decides per turn whether a tool call (including `search_knowledge`) is needed at all, so small talk never triggers a search without a dedicated routing prompt.
 
-Rewrite. The node that turns a context-dependent message into a standalone search query.
+ReAct agent. The outer tool-calling loop (`langgraph.prebuilt.create_react_agent`) that reads the conversation, decides which of the six tools to call, if any, and repeats until it produces a final answer with no more tool calls.
 
-Grade. The node that judges whether the retrieved chunks answer the question.
+Rewrite. The retrieval-subgraph node that turns a raw question into a standalone search query.
 
-Self-check (groundedness check). The final node that confirms every claim in the answer traces to a source.
+Assess. The retrieval-subgraph node that grades whether the retrieved chunks answer the question — named `assess`, not `grade`, because `grade` collides with the subgraph's own state key of the same name.
+
+Self-check (groundedness check). Runs after the outer agent loop finishes producing a final answer — a plain function call (`check_grounded`), not a graph node — and confirms every claim in the answer traces to a source gathered during the turn.
 
 ## Model and cost
 
