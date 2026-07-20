@@ -8,13 +8,17 @@ Pinecone (Voyage embeddings + rerank) and generates with Claude.
 
 ```bash
 cp .env.example .env          # fill in keys (reuse the frontend's)
-python -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv      # Python 3.11 or 3.12 (not 3.14 — ML wheels lag)
+source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
 - Health: http://localhost:8000/health
 - Swagger: http://localhost:8000/docs
+
+Then start the frontend in a second terminal (`cd ../frontend && npm run dev`);
+its `RAG_API_URL` points here. Full two-terminal walkthrough: the root README.
 
 ## Endpoints (target)
 

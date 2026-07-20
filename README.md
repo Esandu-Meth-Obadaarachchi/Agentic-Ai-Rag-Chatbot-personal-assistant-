@@ -37,24 +37,54 @@ agentic-rag-aws/
         └─ Claude     (generation + agent reasoning)
 ```
 
-## Quick start
+## Run it locally (two terminals)
+
+The backend and frontend run as two processes. Start the backend first, then the
+frontend pointed at it.
+
+### Terminal 1 — backend (FastAPI, port 8000)
 
 ```bash
-# Backend
 cd backend
-cp .env.example .env        # fill in the keys (reuse the frontend's)
-python -m venv .venv && source .venv/bin/activate
+cp .env.example .env                       # fill in the keys (reuse the frontend's)
+python3.11 -m venv .venv                    # Python 3.11 or 3.12 (not 3.14 — ML wheels lag)
+source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-# open http://localhost:8000/health and http://localhost:8000/docs
-
-# Frontend
-cd frontend
-npm install
-npm run dev                 # http://localhost:3000
 ```
 
-Or run both with Docker: `docker compose up --build`.
+Check it: http://localhost:8000/health and http://localhost:8000/docs (Swagger).
+
+### Terminal 2 — frontend (Next.js, port 3000)
+
+```bash
+cd frontend
+npm install
+npm run dev                                 # http://localhost:3000
+# if port 3000 is taken, pick another: npm run dev -- -p 3002
+```
+
+The frontend's `RAG_API_URL` (in `frontend/.env.local`) points at the backend,
+default `http://localhost:8000`. Open the frontend, sign in with Google, and the
+agent chat flows through to FastAPI.
+
+### Restarting a background run
+
+```bash
+pkill -f "uvicorn app.main:app"             # stop the backend
+pkill -f "next dev"                          # stop the frontend (careful: stops all Next dev servers)
+```
+
+## Run the backend in Docker
+
+```bash
+cd backend
+docker build --platform linux/amd64 -t agentic-rag-api .   # linux/amd64 for M1 -> ECS
+docker run --env-file .env -p 8000:8000 agentic-rag-api
+```
+
+Or both together: `docker compose up --build` (see `docker-compose.yml`).
+Deploying to AWS ECS: `docs/15-deploy-aws-ecs.md`.
 
 ## Build phases
 
