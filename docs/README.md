@@ -24,6 +24,7 @@ The goal is understanding, not copy-paste. Every file explains the why before th
 | 13 | [glossary.md](13-glossary.md) | Every term, matched to what this build actually does |
 | 14 | [model-hosting.md](14-model-hosting.md) | Why every model call is a hosted API, none in-process |
 | 15 | [deploy-aws-ecs.md](15-deploy-aws-ecs.md) | Build → ECR → Secrets Manager → Fargate → ALB |
+| 16 | [end-to-end-flow.md](16-end-to-end-flow.md) | The whole system in one read: browser to answer, with the LangChain/LangGraph split spelled out |
 
 ## The one-paragraph summary
 
