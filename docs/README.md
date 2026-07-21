@@ -25,6 +25,7 @@ The goal is understanding, not copy-paste. Every file explains the why before th
 | 14 | [model-hosting.md](14-model-hosting.md) | Why every model call is a hosted API, none in-process |
 | 15 | [deploy-aws-ecs.md](15-deploy-aws-ecs.md) | Build → ECR → Secrets Manager → Fargate → ALB |
 | 16 | [end-to-end-flow.md](16-end-to-end-flow.md) | The whole system in one read: browser to answer, with the LangChain/LangGraph split spelled out |
+| 17 | [frontend-overview.md](17-frontend-overview.md) | Lune AI: every feature, the full tech stack, and what's still live vs. dead code after the rebuild |
 
 ## The one-paragraph summary
 
